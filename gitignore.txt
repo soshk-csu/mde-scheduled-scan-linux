@@ -1,0 +1,39 @@
+# Logs
+*.log
+*.log.*.bak
+/var/log/mde-scheduler/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Archives
+*.tar.gz
+*.zip
+*.tgz
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# Shell history
+.bash_history
+.sh_history
+
+# Environment files
+.env
+.env.local
+.env.*.local

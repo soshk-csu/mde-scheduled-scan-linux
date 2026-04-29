@@ -23,6 +23,19 @@ Each script handles the full lifecycle: pre-flight validation, scan wrapper crea
 - **Clean uninstall** — fully reversible deployment
 - **Systemd hardening** — sandboxing, CPU/IO scheduling, and timeout controls
 - **Randomized delay** — (systemd) prevents scan storms across fleet deployments
+- **Graceful error handling** — (v1.1) systemctl failures are caught and reported, never silent
+
+---
+
+## Changelog
+
+### v1.1 (Current)
+- **Fixed:** Silent exit bug in `enable_timer()` — `set -euo pipefail` caused the script to terminate without output when `systemctl enable` or `systemctl start` failed. The function now wraps each `systemctl` call in explicit `if`-blocks with descriptive error messages and continues to `verify_installation()`.
+- **Enhanced:** `verify_installation()` now checks for unit files on disk, reports actionable fix commands for each failed check, and always prints the deployment summary and useful commands reference.
+- **Added:** Version label in header output and deployment summary.
+
+### v1.0
+- Initial release with cron and systemd deployment scripts.
 
 ---
 
@@ -32,7 +45,7 @@ Each script handles the full lifecycle: pre-flight validation, scan wrapper crea
 mde-linux-scheduler/
 ├── scripts/
 │   ├── deploy-mde-cron.sh        # Cron-based deployment
-│   └── deploy-mde-systemd.sh     # Systemd timer-based deployment
+│   └── deploy-mde-systemd.sh     # Systemd timer-based deployment (v1.1)
 ├── .github/
 │   └── workflows/
 │       └── test.yml              # CI pipeline (shellcheck + syntax)
@@ -124,6 +137,16 @@ sudo ./scripts/deploy-mde-cron.sh --uninstall
 | `-v, --verbose` | Verbose output | — |
 | `-h, --help` | Show help | — |
 
+#### Cron Verification
+
+```bash
+# Check the cron job exists
+cat /etc/cron.d/mde-scheduled-scan
+
+# List cron jobs for root
+sudo crontab -l 2>/dev/null; ls -la /etc/cron.d/mde-*
+```
+
 ### Systemd Deployment
 
 ```bash
@@ -157,6 +180,27 @@ sudo ./scripts/deploy-mde-systemd.sh --uninstall
 | `-v, --verbose` | Verbose output | — |
 | `-h, --help` | Show help | — |
 
+#### Systemd Verification
+
+> **Important:** Systemd deployments use unit files in `/etc/systemd/system/`, NOT cron files in `/etc/cron.d/`. Use the commands below — not `crontab -l` or `cat /etc/cron.d/mde-*`.
+
+```bash
+# Check timer status
+systemctl status mde-scheduled-scan.timer
+
+# View next scheduled run
+systemctl list-timers mde-scheduled-scan.timer
+
+# View scan logs via journald
+journalctl -u mde-scheduled-scan.service --since today
+
+# Manually trigger a scan (for testing)
+sudo systemctl start mde-scheduled-scan.service
+
+# Check service result after manual trigger
+systemctl status mde-scheduled-scan.service
+```
+
 ---
 
 ## Cron vs. Systemd — Which to Choose?
@@ -169,6 +213,7 @@ sudo ./scripts/deploy-mde-systemd.sh --uninstall
 | **Resource control** | None | CPU/IO scheduling, sandboxing |
 | **Logging** | Script-managed | Script-managed + journalctl |
 | **Dependencies** | None | Can wait for network/mdatp |
+| **Error handling** | N/A | Graceful fallthrough (v1.1) |
 | **Best for** | Legacy systems, minimal setups | Modern distros, enterprise fleets |
 
 **Recommendation:** Use **systemd** on modern distributions for better reliability and resource control. Use **cron** on legacy systems or minimal environments without systemd.
@@ -196,36 +241,6 @@ journalctl -u mde-scheduled-scan.service --since today
 
 ---
 
-## Verification
-
-### Cron
-
-```bash
-# Check the cron job exists
-cat /etc/cron.d/mde-scheduled-scan
-
-# List cron jobs for root
-sudo crontab -l 2>/dev/null; ls -la /etc/cron.d/mde-*
-```
-
-### Systemd
-
-```bash
-# Check timer status
-systemctl status mde-scheduled-scan.timer
-
-# View next scheduled run
-systemctl list-timers mde-scheduled-scan.timer
-
-# Manually trigger a scan (for testing)
-sudo systemctl start mde-scheduled-scan.service
-
-# Check service result
-systemctl status mde-scheduled-scan.service
-```
-
----
-
 ## Troubleshooting
 
 | Issue | Resolution |
@@ -237,6 +252,8 @@ systemctl status mde-scheduled-scan.service
 | `Invalid OnCalendar expression` | Test with `systemd-analyze calendar "your expression"` |
 | Permission denied | Run with `sudo` or as root |
 | Timer shows `inactive` | Run `sudo systemctl enable --now mde-scheduled-scan.timer` |
+| Verification produces no output (systemd) | **v1.0 bug** — upgrade to v1.1 which wraps `systemctl` calls in explicit if-blocks with graceful fallthrough to `verify_installation()` |
+| `cron.d/mde-*` not found after systemd deploy | **Expected** — systemd creates unit files in `/etc/systemd/system/`, not `/etc/cron.d/`. Use `systemctl status mde-scheduled-scan.timer` to verify |
 
 ---
 
@@ -248,6 +265,23 @@ systemctl status mde-scheduled-scan.service
 - Log directories are created with **mode 750**
 - All file paths are validated before use
 - The `set -euo pipefail` ensures scripts fail fast on errors
+- (v1.1) Critical `systemctl` calls are wrapped with graceful error handling to prevent silent failures
+
+---
+
+## CI/CD Pipeline
+
+The included GitHub Actions workflow (`.github/workflows/test.yml`) runs:
+
+1. **ShellCheck Lint** — Static analysis for all shell scripts
+2. **Bash Syntax Validation** — `bash -n` syntax check
+3. **File Permissions Audit** — Verifies scripts have execute permission
+4. **Multi-Distro Matrix** — Syntax + help + dry-run tests across:
+   - Ubuntu 22.04, Ubuntu 24.04
+   - Debian 12
+   - Rocky Linux 9, AlmaLinux 9
+   - Fedora 40
+   - Amazon Linux 2023
 
 ---
 

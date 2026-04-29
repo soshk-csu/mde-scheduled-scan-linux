@@ -4,6 +4,12 @@
 # ==============================================================================
 # Deploys a systemd timer-based scheduled scan for MDE on Linux endpoints.
 #
+# Version: 1.1
+# Changelog:
+#   v1.1 — Fixed silent exit bug in enable_timer() caused by set -euo pipefail.
+#           Enhanced verify_installation() with actionable diagnostics.
+#   v1.0 — Initial release.
+#
 # Copyright (c) 2026 SOS Group Limited — Cyber Security Unit
 # Licensed under the MIT License. See LICENSE for details.
 # ==============================================================================
@@ -262,18 +268,38 @@ EOF
     log_info "Timer unit created: $unit_file"
 }
 
-# ── Enable & start ───────────────────────────────────────────────────────────
+# ── Enable & start (v1.1 — graceful error handling) ─────────────────────────
 enable_timer() {
     log_step "Enabling and starting systemd timer..."
 
     if [[ "$DRY_RUN" == true ]]; then
         log_info "[DRY RUN] Would reload systemd and enable ${SERVICE_NAME}.timer"
-        return
+        return 0
     fi
 
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}.timer"
-    systemctl start "${SERVICE_NAME}.timer"
+    # daemon-reload: apply new/changed unit files
+    if ! systemctl daemon-reload 2>&1; then
+        log_warn "daemon-reload returned non-zero (may be harmless)."
+    fi
+
+    # Enable the timer to start on boot
+    if ! systemctl enable "${SERVICE_NAME}.timer" 2>&1; then
+        log_error "Failed to enable ${SERVICE_NAME}.timer."
+        log_error "Debug with: systemctl status ${SERVICE_NAME}.timer"
+        log_error "            cat /etc/systemd/system/${SERVICE_NAME}.timer"
+        log_warn "Continuing to verification step..."
+        return 0
+    fi
+
+    # Start the timer now
+    if ! systemctl start "${SERVICE_NAME}.timer" 2>&1; then
+        log_error "Failed to start ${SERVICE_NAME}.timer."
+        log_error "Debug with: journalctl -xe --unit=${SERVICE_NAME}.timer"
+        log_error "            systemctl status ${SERVICE_NAME}.timer"
+        log_warn "Continuing to verification step..."
+        return 0
+    fi
+
     log_info "Timer enabled and started."
 }
 
@@ -323,54 +349,95 @@ uninstall() {
     exit 0
 }
 
-# ── Verification ─────────────────────────────────────────────────────────────
+# ── Verification (v1.1 — enhanced diagnostics) ──────────────────────────────
 verify_installation() {
     log_step "Verifying installation..."
 
     local ok=true
+    local timer_file="/etc/systemd/system/${SERVICE_NAME}.timer"
+    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    local scan_script="${LOG_DIR}/run-mde-scan.sh"
+
+    # Check unit files exist on disk
+    if [[ ! -f "$timer_file" ]]; then
+        log_error "Timer unit file missing: $timer_file"
+        ok=false
+    else
+        log_verbose "Timer unit file exists: $timer_file"
+    fi
+
+    if [[ ! -f "$service_file" ]]; then
+        log_error "Service unit file missing: $service_file"
+        ok=false
+    else
+        log_verbose "Service unit file exists: $service_file"
+    fi
 
     # Check timer is active
     if ! systemctl is-active --quiet "${SERVICE_NAME}.timer" 2>/dev/null; then
-        log_error "Timer ${SERVICE_NAME}.timer is not active."
+        log_error "Timer ${SERVICE_NAME}.timer is NOT active."
+        log_error "  Fix: sudo systemctl start ${SERVICE_NAME}.timer"
+        log_error "  Debug: journalctl -xe --unit=${SERVICE_NAME}.timer"
         ok=false
+    else
+        log_info "Timer is active: ${SERVICE_NAME}.timer"
     fi
 
     # Check timer is enabled
     if ! systemctl is-enabled --quiet "${SERVICE_NAME}.timer" 2>/dev/null; then
-        log_error "Timer ${SERVICE_NAME}.timer is not enabled."
+        log_error "Timer ${SERVICE_NAME}.timer is NOT enabled (won't survive reboot)."
+        log_error "  Fix: sudo systemctl enable ${SERVICE_NAME}.timer"
         ok=false
+    else
+        log_info "Timer is enabled: ${SERVICE_NAME}.timer"
     fi
 
     # Check scan script
-    local scan_script="${LOG_DIR}/run-mde-scan.sh"
     if [[ ! -x "$scan_script" ]]; then
         log_error "Scan wrapper script missing or not executable: $scan_script"
+        log_error "  Fix: chmod 700 $scan_script"
         ok=false
+    else
+        log_info "Scan wrapper script ready: $scan_script"
     fi
 
+    # ── Summary ──────────────────────────────────────────────────────────
+    echo ""
     if [[ "$ok" == true ]]; then
         log_info "Verification passed — all components installed correctly."
-        echo ""
-        echo -e "${BOLD}━━━ Deployment Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  Scan type       : ${CYAN}${SCAN_TYPE}${NC}"
-        echo -e "  Calendar        : ${CYAN}${SCAN_CALENDAR}${NC}"
-        echo -e "  Random delay    : ${CYAN}${RANDOMIZED_DELAY}${NC}"
-        echo -e "  Service         : ${CYAN}${SERVICE_NAME}.service${NC}"
-        echo -e "  Timer           : ${CYAN}${SERVICE_NAME}.timer${NC}"
-        echo -e "  Log file        : ${CYAN}${LOG_FILE}${NC}"
-        echo -e "  Log retention   : ${CYAN}${RETENTION_DAYS} days${NC}"
-        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo ""
-
-        # Show next trigger time
-        local next_run
-        next_run=$(systemctl list-timers "${SERVICE_NAME}.timer" --no-pager 2>/dev/null | tail -2 | head -1 || echo "")
-        if [[ -n "$next_run" ]]; then
-            echo -e "  ${BOLD}Next scheduled run:${NC}"
-            echo "  $next_run"
-        fi
     else
-        die "Verification failed — review errors above."
+        log_error "Verification FAILED — review errors above and apply fixes."
+    fi
+
+    echo ""
+    echo -e "${BOLD}━━━ Deployment Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  Version       : ${CYAN}1.1${NC}"
+    echo -e "  Scan type     : ${CYAN}${SCAN_TYPE}${NC}"
+    echo -e "  Calendar      : ${CYAN}${SCAN_CALENDAR}${NC}"
+    echo -e "  Random delay  : ${CYAN}${RANDOMIZED_DELAY}${NC}"
+    echo -e "  Service       : ${CYAN}${SERVICE_NAME}.service${NC}"
+    echo -e "  Timer         : ${CYAN}${SERVICE_NAME}.timer${NC}"
+    echo -e "  Log file      : ${CYAN}${LOG_FILE}${NC}"
+    echo -e "  Log retention : ${CYAN}${RETENTION_DAYS} days${NC}"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    # Show next trigger time (best-effort)
+    if systemctl is-active --quiet "${SERVICE_NAME}.timer" 2>/dev/null; then
+        echo -e "  ${BOLD}Next scheduled run:${NC}"
+        systemctl list-timers "${SERVICE_NAME}.timer" --no-pager 2>/dev/null | head -3 || true
+        echo ""
+    fi
+
+    echo -e "  ${BOLD}Useful commands:${NC}"
+    echo -e "    systemctl status ${SERVICE_NAME}.timer       # Check timer status"
+    echo -e "    systemctl list-timers ${SERVICE_NAME}.timer   # View next run"
+    echo -e "    journalctl -u ${SERVICE_NAME}.service        # View scan logs"
+    echo -e "    sudo systemctl start ${SERVICE_NAME}.service  # Trigger scan now"
+    echo ""
+
+    if [[ "$ok" != true ]]; then
+        die "Deployment completed with errors — see above."
     fi
 }
 
@@ -391,8 +458,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-echo -e "${BOLD}MDE Linux Scheduler — Systemd Deployment${NC}"
-echo -e "──────────────────────────────────────────"
+echo -e "${BOLD}MDE Linux Scheduler — Systemd Deployment (v1.1)${NC}"
+echo -e "──────────────────────────────────────────────────"
 
 preflight_checks
 
